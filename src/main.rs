@@ -1,9 +1,11 @@
 #[macro_use]
 extern crate conrod;
+use api::{Api, SetData};
 use conrod::backend::glium::glium::backend::glutin::glutin::VirtualKeyCode;
 use conrod::backend::glium::glium::{self, Surface};
 use conrod::glium::glutin::EventsLoop;
 use conrod::glium::Display;
+use conrod::image::Map;
 use conrod::{widget, Colorable, Positionable, Sizeable, Ui, Widget};
 use find_folder;
 use image::DynamicImage;
@@ -17,6 +19,8 @@ const NAVIGATION_KEYS_DEBOUNCE_THRESHOLD: u128 = 150;
 
 struct LeftRight(usize);
 struct TopDown(usize);
+
+widget_ids!(struct Ids { text, img, img2 });
 
 pub struct EventLoop {
     ui_needs_update: bool,
@@ -115,6 +119,101 @@ fn load_fonts(ui: &mut Ui) {
     ui.fonts.insert_from_file(font_path).unwrap();
 }
 
+struct SetRow<'a> {
+    title: &'a str,
+    set_data: SetData<'a>,
+    set_idx: usize,
+}
+
+impl<'a> SetRow<'a> {
+    fn new(set_data: SetData<'a>, set_idx: usize) -> Self {
+        debug!("Initialized Set row: {:?}", set_data);
+        let title = set_data.get_title();
+        Self {
+            set_data,
+            title,
+            set_idx,
+        }
+    }
+
+    fn get_top_offset(&self) -> f64 {
+        (self.set_idx as f64) * 200.0 + 70.0
+    }
+
+    fn show(
+        &self,
+        display: &Display,
+        ui: &mut Ui,
+        image_map: &mut Map<glium::texture::Texture2d>,
+        ids: &Ids,
+        item_idx: usize,
+    ) {
+        let ui = &mut ui.set_widgets();
+        let img = self
+            .set_data
+            .get_home_tile_image(item_idx)
+            .unwrap_or_else(|e| {
+                warn!("{}", e);
+                load_img_not_found()
+            });
+
+        let img = load_img(display, img);
+        let (w, h) = (img.get_width(), img.get_height().unwrap());
+        let img = image_map.insert(img);
+
+        widget::Image::new(img)
+            .w_h(w as f64, h as f64)
+            .top_left_with_margins_on(ui.window, self.get_top_offset(), 20.0)
+            .set(ids.img, ui);
+
+        widget::Text::new(self.title)
+            .up_from(ids.img, 14.0)
+            .color(conrod::color::WHITE)
+            .font_size(36)
+            .set(ids.text, ui);
+    }
+}
+
+struct DisplayController<'a> {
+    rows: Vec<SetRow<'a>>,
+    display: &'a Display,
+    image_map: Map<glium::texture::Texture2d>,
+    api_handle: &'a Api,
+    ids: Ids,
+}
+
+impl<'a> DisplayController<'a> {
+    fn new(display: &'a Display, api_handle: &'a Api, ui: &mut Ui) -> Self {
+        let ids = Ids::new(ui.widget_id_generator());
+        Self {
+            rows: Vec::new(),
+            display,
+            image_map: Map::<glium::texture::Texture2d>::new(),
+            api_handle,
+            ids,
+        }
+    }
+
+    fn show_n_rows(&mut self, n: usize, ui: &mut Ui) {
+        for set_idx in 0..n {
+            let row_data = self.api_handle.get_set(set_idx).expect("TODO testing");
+            let set_row = SetRow::new(row_data, set_idx);
+            set_row.show(self.display, ui, &mut self.image_map, &self.ids, 0);
+            self.rows.push(set_row);
+        }
+    }
+
+    fn navigate_to(&mut self, set_idx: usize, item_idx: usize, ui: &mut Ui) {
+        info!("Image map size {}", self.image_map.len());
+        if set_idx >= self.rows.len() {
+            let row_data = self.api_handle.get_set(set_idx).expect("TODO testing");
+            let set_row = SetRow::new(row_data, set_idx);
+            self.rows.push(set_row);
+        }
+        self.rows[set_idx].show(self.display, ui, &mut self.image_map, &self.ids, item_idx);
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let (display, mut events_loop) = build_display();
@@ -128,42 +227,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         a
     };
 
-    widget_ids!(struct Ids { text, img, img2 });
-    let ids = Ids::new(ui.widget_id_generator());
-
-    let img = load_img(&display, api_handle.get_image().unwrap());
-    let (w, h) = (img.get_width(), img.get_height().unwrap());
-    let mut image_map = conrod::image::Map::<glium::texture::Texture2d>::new();
-    let img = image_map.insert(img);
-
     let mut renderer = conrod::backend::glium::Renderer::new(&display).unwrap();
     let mut event_loop = EventLoop::new();
-    {
-        let ui = &mut ui.set_widgets();
-        // // // "Hello World!" in the middle of the screen.
-        widget::Text::new("Hello World!")
-            .middle_of(ui.window)
-            .color(conrod::color::WHITE)
-            .font_size(68)
-            .set(ids.text, ui);
 
-        widget::Image::new(img)
-            .w_h(w as f64, h as f64)
-            .mid_bottom()
-            .set(ids.img, ui);
-    }
+    let mut controller = DisplayController::new(&display, &api_handle, &mut ui);
+    controller.show_n_rows(4, &mut ui);
 
-    let mut item = LeftRight(0);
-    let mut set_num = TopDown(0);
+    let mut item_idx = LeftRight(0);
+    let mut set_idx = TopDown(0);
     let mut navigation_debounce = Instant::now();
 
     'main: loop {
         // Render the `Ui` and then display it on the screen.
         if let Some(primitives) = ui.draw_if_changed() {
-            renderer.fill(&display, primitives, &image_map);
+            renderer.fill(&display, primitives, &controller.image_map);
             let mut target = display.draw();
             target.clear_color(0.0, 0.0, 0.013, 1.0);
-            renderer.draw(&display, &mut target, &image_map).unwrap();
+            renderer
+                .draw(&display, &mut target, &controller.image_map)
+                .unwrap();
             target.finish().unwrap();
         }
         let mut events = Vec::new();
@@ -188,38 +270,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ..
                             },
                         ..
-                    } if is_navigation(
-                        key_code,
-                        &mut item,
-                        &mut set_num,
-                        &mut navigation_debounce,
-                    ) =>
-                    {
-                        let set = api_handle.get_set(set_num.0).expect("TODO testing");
-
-                        debug!("Set {:?}", set);
-                        let res = set.get_home_tile_image(item.0).unwrap_or_else(|e| {
-                            warn!("{}", e);
-                            load_img_not_found()
-                        });
-                        let title = set.get_title();
-
-                        let img = load_img(&display, res);
-                        let (w, h) = (img.get_width(), img.get_height().unwrap());
-                        let img = image_map.insert(img);
-
-                        {
-                            let ui = &mut ui.set_widgets();
-                            widget::Text::new(title)
-                                .mid_top()
-                                .color(conrod::color::WHITE)
-                                .font_size(68)
-                                .set(ids.text, ui);
-
-                            widget::Image::new(img)
-                                .w_h(w as f64, h as f64)
-                                .mid_bottom()
-                                .set(ids.img, ui);
+                    } => {
+                        if user_navigated(
+                            key_code,
+                            &mut item_idx,
+                            &mut set_idx,
+                            &mut navigation_debounce,
+                        ) {
+                            controller.navigate_to(set_idx.0, item_idx.0, &mut ui);
                         }
                     }
                     _ => (),
@@ -231,7 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn is_navigation(
+fn user_navigated(
     key_code: VirtualKeyCode,
     item: &mut LeftRight,
     set_num: &mut TopDown,

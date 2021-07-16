@@ -26,7 +26,7 @@ impl<'a> SetData<'a> {
         Self { entry }
     }
 
-    pub fn get_title(&self) -> &str {
+    pub fn get_title(&self) -> &'a str {
         if let Value::String(ref s) =
             self.entry["text"]["title"]["full"]["set"]["default"]["content"]
         {
@@ -116,9 +116,9 @@ impl Api {
 
     /// Attempt to get the [`SetData`] for the given `set_num`
     ///
-    pub fn get_set(&self, set_num: usize) -> Option<SetData> {
+    pub fn get_set(&self, set_idx: usize) -> Option<SetData> {
         if let Some(data) = self.json_data.as_ref() {
-            let res = &data["data"]["StandardCollection"]["containers"][set_num]["set"];
+            let res = &data["data"]["StandardCollection"]["containers"][set_idx]["set"];
             let set = SetData::new(res);
             Some(set)
         } else {
