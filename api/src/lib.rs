@@ -87,6 +87,7 @@ impl<'a> SetData<'a> {
                 }
                 let buf = response.bytes()?;
                 let img = ImageReader::with_format(Cursor::new(buf), ImageFormat::Jpeg).decode()?;
+                // let img = img.resize(500, 220, FilterType::Lanczos3);
                 Ok(img)
             } else {
                 let err_msg = format!("No url found for item num: '{}'", item_num);
