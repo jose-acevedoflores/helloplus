@@ -1,36 +1,53 @@
+//! ## Hello+
+//!
+//! Clone of a streaming service homepage using [`conrod glium/winit`](https://github.com/PistonDevelopers/conrod)
 #[macro_use]
 extern crate conrod;
 use api::{Api, SetData};
 use conrod::backend::glium::glium::backend::glutin::glutin::VirtualKeyCode;
 use conrod::backend::glium::glium::{self, Surface};
-use conrod::glium::glutin::EventsLoop;
 use conrod::glium::Display;
 use conrod::image::Id;
 use conrod::image::Map;
 use conrod::{widget, Colorable, Positionable, Sizeable, Ui, UiCell, Widget};
-use find_folder;
-use image::imageops::FilterType;
-use image::DynamicImage;
-use log::{debug, info, warn};
+use log::{debug, info};
 use std::ops::Range;
 use std::time::Instant;
+mod helpers;
 
-const WIDTH: u32 = 1920;
-const HEIGHT: u32 = 1080;
+const DISPLAY_WIDTH: u32 = 1920;
+const DISPLAY_HEIGHT: u32 = 1080;
 
-const NAVIGATION_KEYS_DEBOUNCE_THRESHOLD: u128 = 150;
-
+/// Debounce value for handling the Left, Right, Up Down key strokes.
+const NAVIGATION_KEYS_DEBOUNCE_THRESHOLD: u128 = 180;
+/// This field represents the number of visible rows given the [`ROW_HEIGHT`],the [`ROW_TOP_MARGIN`] and the [`DISPLAY_HEIGHT`]
 const NUM_ROWS: usize = 4;
+/// This field serves as the number of spaces reserved in the [Ids::imgs] field for a given row.
+/// This is adjusted to keep at least one out of view image in memory so the user doesn't see a placeholder.
 const ROW_STRIDE: usize = 6;
-const NUM_IMAGES: usize = NUM_ROWS * ROW_STRIDE;
+/// This represents the number of images available to draw. Used for various alignments and as the total size of the [Ids::imgs] field.
+const NUM_OF_CACHED_IMAGES: usize = NUM_ROWS * ROW_STRIDE;
 
-struct LeftRight(usize);
-struct TopDown(usize);
+// **** Start of pixel alignment consts.
+/// Margin to space out the thumbnails. Used to the left and right of the images.
+const ITEMS_MARGIN: f64 = 20.0;
+const IMAGE_WIDTH_PLUS_MARGIN: f64 = 500.0 + 15.0;
+const IMAGE_SCALE_DOWN_FACTOR: f64 = 0.75;
+/// Used to scale the image up so that it looks 15% larger.
+const IMAGE_SCALE_UP_FACTOR: f64 = 1.15;
+const ROW_TOP_MARGIN: f64 = 70.0;
+const ROW_HEIGHT: f64 = 290.0;
 
-type IsHighlighted = bool;
+widget_ids!(
+    /// Hold the [`Id`]s for the row titles and the images
+    struct Ids {
+        titles[],
+        imgs[]
+    }
+);
 
-widget_ids!(struct Ids { titles[], imgs[], canvas[], img_not_found});
-
+/// In order to not spin endlessly this struct will throttle the main loop and queue incoming events.
+/// It will throttle to target 60fps rate.
 pub struct EventLoop {
     last_update: std::time::Instant,
 }
@@ -73,149 +90,245 @@ impl EventLoop {
     }
 }
 
-fn load_img(display: &glium::Display, dyn_img: DynamicImage) -> glium::texture::Texture2d {
-    let rgba_image = dyn_img.to_rgba8();
-    let image_dimensions = rgba_image.dimensions();
-    let raw_image = glium::texture::RawImage2d::from_raw_rgba_reversed(
-        &rgba_image.into_raw(),
-        image_dimensions,
-    );
-    let texture = glium::texture::Texture2d::new(display, raw_image).unwrap();
-    texture
+struct CachedImgData {
+    img_id: Id,
+    w: f64,
+    h: f64,
 }
 
-fn load_img_not_found() -> DynamicImage {
-    let assets = find_folder::Search::ParentsThenKids(3, 3)
-        .for_folder("assets")
-        .unwrap();
-    let path = assets.join("images/image-not-found.png");
-    let img = image::open(&std::path::Path::new(&path)).unwrap();
-    img.resize(500, 220, FilterType::Lanczos3)
+impl CachedImgData {
+    fn new(img_id: Id, w: f64, h: f64) -> Self {
+        Self { img_id, w, h }
+    }
 }
 
-fn build_display() -> (Display, EventsLoop, Ui) {
-    let events_loop = glium::glutin::EventsLoop::new();
-    let window = glium::glutin::WindowBuilder::new()
-        .with_title("Hello Plus")
-        .with_dimensions(WIDTH, HEIGHT);
-    let context = glium::glutin::ContextBuilder::new()
-        .with_vsync(true)
-        .with_multisampling(4);
-
-    let mut ui = conrod::UiBuilder::new([WIDTH as f64, HEIGHT as f64]).build();
-    load_fonts(&mut ui);
-    (
-        glium::Display::new(window, context, &events_loop).unwrap(),
-        events_loop,
-        ui,
-    )
-}
-
-fn load_fonts(ui: &mut Ui) {
-    let assets = find_folder::Search::KidsThenParents(3, 5)
-        .for_folder("assets")
-        .unwrap();
-    let font_path = assets.join("fonts/NotoSans/NotoSans-Regular.ttf");
-    ui.fonts.insert_from_file(font_path).unwrap();
-}
-
+/// Holds the necessary data needed to draw a single row.
+///
+/// Its responsibilities include:
+/// - fetching the resources (title and thumbnail images) and caching them.
+/// - place the visible widgets in the appropriate locations given the combination of `true` and `adjusted` indices.
+/// - controls the navigation for this row via the [`shift_right`](SetRow::shift_right) and [`shift_left`](SetRow::shift_left) methods.
 struct SetRow<'a> {
+    /// Title for this set of data.
     title: &'a str,
+    /// The fetched data retrieved by the [`Api`].
     set_data: SetData<'a>,
-    set_id: usize,
-    cached_img_id: Vec<(Id, f64, f64)>,
-    rem: usize,
+    /// Unique id for this set of data.
+    true_set_idx: usize,
+    /// Cached [`Id`] keys used to map the image data stored in the [`image_map`](DisplayController::image_map)
+    /// IMPROVEMENT: treat as a fixed sized array to only keep the
+    cached_img_id: Vec<CachedImgData>,
+    /// Combined with the `adjusted_item_idx` it produces the `true_item_idx` for this specific row.
+    left_right_idx_adjustment: usize,
 }
 
 impl<'a> SetRow<'a> {
-    fn new(set_data: SetData<'a>, set_idx: usize) -> Self {
+    /// Constructor.
+    fn new(set_data: SetData<'a>, true_set_idx: usize) -> Self {
         debug!("Initialized Set row: {:?}", set_data);
         let title = set_data.get_title();
         Self {
             set_data,
             title,
-            set_id: set_idx,
+            true_set_idx,
             cached_img_id: Vec::new(),
-            rem: (ROW_STRIDE * (set_idx + 1)),
+            left_right_idx_adjustment: 0,
         }
     }
 
-    fn get_top_offset(&self, canvas_index: usize) -> f64 {
-        (canvas_index as f64) * 290.0 + 70.0
+    /// Shift right on a given row. Returns a bool because it needs to check that row's specific
+    /// item count.
+    /// # Arguments
+    /// * `adjusted_item_idx`: this is the index that stays between the 0 to [`ROW_STRIDE`]-1 range.
+    /// * `true_item_idx`: this is the full index into this row's items.
+    fn shift_right(&mut self, adjusted_item_idx: usize, true_item_idx: usize) -> bool {
+        if (true_item_idx + 1) < self.set_data.get_item_count() {
+            if adjusted_item_idx + 4 > ROW_STRIDE {
+                self.left_right_idx_adjustment += 1;
+            }
+            true
+        } else {
+            false
+        }
     }
 
-    fn get_left_offset(&self, item_idx: usize) -> f64 {
-        (item_idx as f64) * 515.0 * 0.75 + 20.0
+    ///
+    /// # Arguments
+    /// * `adjusted_item_idx`: this is the index that stays between the 0 to [`ROW_STRIDE`]-1 range.
+    fn shift_left(&mut self, adjusted_item_idx: usize) {
+        if self.left_right_idx_adjustment > 0 {
+            if adjusted_item_idx < 2 {
+                self.left_right_idx_adjustment -= 1;
+            }
+        }
     }
 
-    fn get_img_idx(&self, item_idx: usize, canvas_idx: usize) -> usize {
-        (canvas_idx * ROW_STRIDE + item_idx) % self.rem
+    ///
+    /// # Arguments
+    /// * `adjusted_set_idx`: This is the canvas index for this set of data. This index is adjusted to
+    ///    stay between 0 and [`NUM_ROWS`]-1
+    fn get_top_offset(&self, adjusted_set_idx: usize) -> f64 {
+        (adjusted_set_idx as f64) * ROW_HEIGHT + ROW_TOP_MARGIN
     }
 
-    /// Sets the widget for a single image to be displayed for this row
-    /// Returns true if this image should be highlighted (scaled up)
+    /// # Arguments
+    /// * `adjusted_item_idx`: this is the canvas index for the item (always between 0 and [`ROW_STRIDE`]-1).
+    fn get_left_offset(&self, adjusted_item_idx: usize) -> f64 {
+        (adjusted_item_idx as f64) * IMAGE_WIDTH_PLUS_MARGIN * IMAGE_SCALE_DOWN_FACTOR
+            + ITEMS_MARGIN
+    }
+
+    ///
+    /// # Arguments
+    /// * `adjusted_item_idx`: this is the canvas index for the item (always between 0 and [`ROW_STRIDE`]-1).
+    /// * `adjusted_set_idx`: This is the canvas index for this set of data. This index is adjusted to
+    ///    stay between 0 and [`NUM_ROWS`]-1
+    fn get_img_idx(&self, adjusted_item_idx: usize, adjusted_set_idx: usize) -> usize {
+        adjusted_set_idx * ROW_STRIDE + adjusted_item_idx
+    }
+
+    /// Sets the widget to display the appropriate image for this row given the `adjusted_*` indices.
+    /// Returns true if this image should be highlighted (scaled up).
     ///
     /// NOTE: The reason we don't set the scaled up widget here is because when the image scales up
     /// it takes some space from the previous and next image. If we set the scale here then the next image
     /// will overlap and it will appear on top of the currently highlighted image. The scaled up
     /// image is drawn last to make sure it will be on top.
+    /// # Argumets
+    /// * `adjusted_item_idx`: this is the canvas index for the item (always between 0 and [`ROW_STRIDE`]-1).
+    /// * `adjusted_set_idx`: This is the canvas index for this set of data. This index is adjusted to
+    ///    stay between 0 and [`NUM_ROWS`]-1
     fn show(
         &mut self,
         display: &Display,
         ui: &mut UiCell,
         image_map: &mut Map<glium::texture::Texture2d>,
         ids: &Ids,
-        item_idx: usize,
         cursor: &Cursor,
         nf_id: &Id,
-        canvas_idx: usize,
-    ) -> IsHighlighted {
-        let id = self.cached_img_id.get(item_idx);
+        adjusted_item_idx: usize,
+        adjusted_set_idx: usize,
+    ) -> Option<HighlightedItemData> {
+        let true_item_idx = adjusted_item_idx + self.left_right_idx_adjustment;
 
-        let (img_id, w, h) = if let Some((id, w, h)) = id {
-            (id.clone(), w.clone(), h.clone())
-        } else {
-            let img = self.set_data.get_home_tile_image(item_idx);
+        if self.cached_img_id.get(true_item_idx).is_none() {
+            let img = self.set_data.get_home_tile_image(true_item_idx);
 
             if let Ok(img) = img {
-                let img = load_img(display, img);
+                let img = helpers::load_img(display, img);
                 let (w, h) = (img.get_width(), img.get_height().unwrap());
                 let img_id = image_map.insert(img);
-                let w = (w as f64) * 0.75;
-                let h = (h as f64) * 0.75;
+                let w = (w as f64) * IMAGE_SCALE_DOWN_FACTOR;
+                let h = (h as f64) * IMAGE_SCALE_DOWN_FACTOR;
                 info!("put img {:?} ar {}", img_id, w / h);
-                self.cached_img_id.push((img_id.clone(), w, h));
-                (img_id, w, h)
+                self.cached_img_id.push(CachedImgData::new(img_id, w, h));
             } else {
-                self.cached_img_id
-                    .push((nf_id.clone(), 500.0 * 0.75, 220.0 * 0.75));
-                (nf_id.clone(), 500.0 * 0.75, 220.0 * 0.75)
+                self.cached_img_id.push(CachedImgData::new(
+                    nf_id.clone(),
+                    500.0 * 0.75,
+                    220.0 * 0.75,
+                ));
             }
         };
 
+        // We know that from the previous if block there will be an item at true_item_idx now
+        let data = self.cached_img_id.get(true_item_idx).unwrap();
+
+        let hd =
+            if cursor.true_set_idx == self.true_set_idx && cursor.true_item_idx == true_item_idx {
+                Some(HighlightedItemData {
+                    img_id: data.img_id,
+                    w: data.w,
+                    h: data.h,
+                    true_set_idx: self.true_set_idx,
+                    adjusted_item_idx,
+                    adjusted_set_idx,
+                })
+            } else {
+                None
+            };
+
+        self.draw_image(
+            data.img_id,
+            data.w,
+            data.h,
+            adjusted_set_idx,
+            adjusted_item_idx,
+            ids,
+            ui,
+        );
+
+        // Return true if this item needs to be scaled up (highlighted)
+        hd
+    }
+
+    fn draw_image(
+        &self,
+        img_id: Id,
+        w: f64,
+        h: f64,
+        adjusted_set_idx: usize,
+        adjusted_item_idx: usize,
+        ids: &Ids,
+        ui: &mut UiCell,
+    ) {
         widget::Image::new(img_id)
             .w_h(w, h)
             .top_left_with_margins_on(
                 ui.window,
-                self.get_top_offset(canvas_idx),
-                self.get_left_offset(item_idx),
+                self.get_top_offset(adjusted_set_idx),
+                self.get_left_offset(adjusted_item_idx),
             )
-            .set(ids.imgs[self.get_img_idx(item_idx, canvas_idx)], ui);
+            .set(
+                ids.imgs[self.get_img_idx(adjusted_item_idx, adjusted_set_idx)],
+                ui,
+            );
+    }
 
-        cursor.set_idx == self.set_id && cursor.item_idx == item_idx
+    /// Enlarges the image by [`IMAGE_SCALE_UP_FACTOR`] and also moves it back and up by [`ITEMS_MARGIN`].
+    fn draw_image_highlighted(
+        &self,
+        img_id: Id,
+        w: f64,
+        h: f64,
+        adjusted_set_idx: usize,
+        adjusted_item_idx: usize,
+        ids: &Ids,
+        ui: &mut UiCell,
+    ) {
+        widget::Image::new(img_id)
+            .w_h(w * IMAGE_SCALE_UP_FACTOR, h * IMAGE_SCALE_UP_FACTOR)
+            .top_left_with_margins_on(
+                ui.window,
+                self.get_top_offset(adjusted_set_idx) - ITEMS_MARGIN,
+                self.get_left_offset(adjusted_item_idx) - ITEMS_MARGIN,
+            )
+            .set(
+                ids.imgs[self.get_img_idx(adjusted_item_idx, adjusted_set_idx)],
+                ui,
+            );
     }
 
     /// Sets the text widget for the set title.
-    fn show_row_title(&self, canvas_idx: usize, ids: &Ids, ui: &mut UiCell) {
+    ///
+    /// This method places the index above the first leftmost image for a given set (`adjusted_set_idx`)
+    /// # Arguments
+    /// * `adjusted_set_idx`: This is the canvas index for this set of data. This index is adjusted to
+    ///    stay between 0 and [`NUM_ROWS`]-1
+    fn show_row_title(&self, adjusted_set_idx: usize, ids: &Ids, ui: &mut UiCell) {
         widget::Text::new(self.title)
-            .up_from(ids.imgs[ROW_STRIDE * canvas_idx], 14.0)
+            .up_from(ids.imgs[ROW_STRIDE * adjusted_set_idx], 24.0)
             .color(conrod::color::WHITE)
             .font_size(28)
-            .set(ids.titles[self.set_id % NUM_ROWS], ui);
+            .set(ids.titles[self.true_set_idx % NUM_ROWS], ui);
     }
 }
 
+/// Main structure controlling the widgets that should be displayed.
+/// Its main responsibility is interpreting the navigation commands (Left, Right, Up or Down)
+/// and adjust the internal state to reflect what should be displayed.
 struct DisplayController<'a> {
+    initialized: bool,
     rows: Vec<SetRow<'a>>,
     display: &'a Display,
     image_map: Map<glium::texture::Texture2d>,
@@ -223,21 +336,23 @@ struct DisplayController<'a> {
     ids: Ids,
     nf_id: Id,
     prev_visible_range: Range<usize>,
+    cursor: Cursor,
 }
 
 impl<'a> DisplayController<'a> {
     fn new(display: &'a Display, api_handle: &'a Api, ui: &mut Ui) -> Self {
         let mut ids = Ids::new(ui.widget_id_generator());
-        ids.imgs.resize(NUM_IMAGES, &mut ui.widget_id_generator());
+        ids.imgs
+            .resize(NUM_OF_CACHED_IMAGES, &mut ui.widget_id_generator());
         ids.titles.resize(NUM_ROWS, &mut ui.widget_id_generator());
-        ids.canvas.resize(NUM_ROWS, &mut ui.widget_id_generator());
 
         let mut image_map = Map::<glium::texture::Texture2d>::new();
-        let nf = load_img_not_found();
-        let img = load_img(display, nf);
+        let nf = helpers::load_img_not_found();
+        let img = helpers::load_img(display, nf);
         let nf_id = image_map.insert(img);
 
         Self {
+            initialized: false,
             rows: Vec::new(),
             display,
             image_map,
@@ -245,27 +360,34 @@ impl<'a> DisplayController<'a> {
             ids,
             nf_id,
             prev_visible_range: 0..NUM_ROWS,
+            cursor: Cursor::default(),
         }
     }
 
+    /// Initialize the DisplayController. This is meant to be called once at start of the program.
     fn initialize(&mut self, ui: &mut Ui, cursor: &Cursor) {
+        if self.initialized {
+            return;
+        }
+        self.initialized = true;
+        //NOTE: in this method, `true` amd `adjusted` indices are the same.
         let ui = &mut ui.set_widgets();
-        for canvas_idx in 0..NUM_ROWS {
-            let row_data = self.api_handle.get_set(canvas_idx).expect("TODO testing");
-            let mut set_row = SetRow::new(row_data, canvas_idx);
+        for set_idx in self.prev_visible_range.clone() {
+            let row_data = self.api_handle.get_set(set_idx).expect("TODO testing");
+            let mut set_row = SetRow::new(row_data, set_idx);
             for item_idx in 0..ROW_STRIDE {
                 set_row.show(
                     self.display,
                     ui,
                     &mut self.image_map,
                     &self.ids,
-                    item_idx,
                     &cursor,
                     &self.nf_id,
-                    canvas_idx,
+                    item_idx,
+                    set_idx,
                 );
             }
-            set_row.show_row_title(canvas_idx, &self.ids, ui);
+            set_row.show_row_title(set_idx, &self.ids, ui);
             self.rows.push(set_row);
         }
     }
@@ -280,7 +402,7 @@ impl<'a> DisplayController<'a> {
     ///  - if from 3 it goes to 4 then visible range now is 2 to 6
     ///  - if user now goes BACK so set_idx is back to 3 the range is still 2 to 6
     ///    This helps ease the transition since it won't jump all the rows back
-    fn visible_range(&mut self, set_idx: usize) -> Range<usize> {
+    fn visible_set_range(&mut self, set_idx: usize) -> Range<usize> {
         if (set_idx - self.prev_visible_range.start) == 1 {
             return self.prev_visible_range.clone();
         }
@@ -295,66 +417,161 @@ impl<'a> DisplayController<'a> {
         new_range
     }
 
-    fn fetch_row(&mut self, set_idx: usize) {
-        let res = self.rows.get_mut(set_idx);
-        if res.is_none() {
-            let row_data = self.api_handle.get_set(set_idx).expect("TODO testing");
-            let set_row = SetRow::new(row_data, set_idx);
-            self.rows.push(set_row);
-            // self.rows.last().unwrap();
+    /// This associated function is meant to be the access point of the Self.rows vector.
+    fn fetch_row<'b>(
+        rows: &'b mut Vec<SetRow<'a>>,
+        true_set_idx: usize,
+        api_handle: &'a Api,
+    ) -> Option<&'b mut SetRow<'a>> {
+        if rows.get_mut(true_set_idx).is_some() {
+            return rows.get_mut(true_set_idx);
+        }
+        // we know res is none so need to fetch the data for this set.
+        let set_row_opt = if let Some(row_data) = api_handle.get_set(true_set_idx) {
+            let set_row = SetRow::new(row_data, true_set_idx);
+            Some(set_row)
+        } else {
+            None
+        };
+        if let Some(set_row) = set_row_opt {
+            rows.push(set_row);
+            rows.last_mut()
+        } else {
+            None
         }
     }
 
-    fn navigate_to(&mut self, set_idx: usize, item_idx: usize, ui: &mut Ui) {
-        info!("Image map size {}. idx:{}", self.image_map.len(), item_idx);
-        let cursor = Cursor { set_idx, item_idx };
+    fn update_image_widgets(&mut self, ui: &mut Ui) {
+        info!(
+            "Image map size {}. idx:{}",
+            self.image_map.len(),
+            self.cursor.true_item_idx
+        );
         let ui = &mut ui.set_widgets();
-        let mut highlighted_idx = (0, 0, 0);
-        for (canvas_idx, set_idx) in self.visible_range(set_idx).enumerate() {
-            self.fetch_row(set_idx);
-            let set_row = &mut self.rows[set_idx];
-            for item_idx in 0..ROW_STRIDE {
+        let mut highlighted_data = None;
+        for (adjusted_set_idx, true_set_idx) in
+            self.visible_set_range(self.cursor.true_set_idx).enumerate()
+        {
+            let fetched = Self::fetch_row(&mut self.rows, true_set_idx, self.api_handle);
+            if fetched.is_none() {
+                break;
+            }
+            let set_row = fetched.unwrap();
+            for adjusted_item_idx in 0..ROW_STRIDE {
                 let found_highlighted = set_row.show(
                     self.display,
                     ui,
                     &mut self.image_map,
                     &self.ids,
-                    item_idx,
-                    &cursor,
+                    &self.cursor,
                     &self.nf_id,
-                    canvas_idx,
+                    adjusted_item_idx,
+                    adjusted_set_idx,
                 );
-                if found_highlighted {
-                    highlighted_idx = (set_idx, item_idx, canvas_idx)
+                if found_highlighted.is_some() {
+                    highlighted_data = found_highlighted;
                 }
             }
-            set_row.show_row_title(canvas_idx, &self.ids, ui);
+            set_row.show_row_title(adjusted_set_idx, &self.ids, ui);
         }
 
-        let (set_idx, item_idx, canvas_idx) = highlighted_idx;
-        let row = &self.rows[set_idx];
-        // //TODO FIX THIS
-        let (img_id, w, h) = &row.cached_img_id[item_idx];
-        widget::Image::new(img_id.clone())
-            .w_h(w * 1.15, h * 1.15)
-            .top_left_with_margins_on(
-                ui.window,
-                row.get_top_offset(canvas_idx) - 20.0,
-                row.get_left_offset(item_idx) - 20.0,
-            )
-            .set(self.ids.imgs[row.get_img_idx(item_idx, canvas_idx)], ui);
+        if let Some(HighlightedItemData {
+            img_id,
+            w,
+            h,
+            true_set_idx,
+            adjusted_item_idx,
+            adjusted_set_idx,
+        }) = highlighted_data
+        {
+            self.cursor.adjusted_item_idx = adjusted_item_idx;
+            if let Some(highlighted_row) =
+                Self::fetch_row(&mut self.rows, true_set_idx, self.api_handle)
+            {
+                highlighted_row.draw_image_highlighted(
+                    img_id,
+                    w,
+                    h,
+                    adjusted_set_idx,
+                    adjusted_item_idx,
+                    &self.ids,
+                    ui,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn move_current_set_left(&mut self, ui: &mut Ui) {
+        if let Some(cur_row_data) =
+            Self::fetch_row(&mut self.rows, self.cursor.true_set_idx, self.api_handle)
+        {
+            cur_row_data.shift_left(self.cursor.adjusted_item_idx);
+            if self.cursor.true_item_idx > 0 {
+                self.cursor.true_item_idx -= 1;
+            }
+            self.update_image_widgets(ui);
+        }
+    }
+
+    pub(crate) fn move_current_set_right(&mut self, ui: &mut Ui) {
+        if let Some(cur_row_data) =
+            Self::fetch_row(&mut self.rows, self.cursor.true_set_idx, self.api_handle)
+        {
+            if cur_row_data.shift_right(self.cursor.adjusted_item_idx, self.cursor.true_item_idx) {
+                self.cursor.true_item_idx += 1;
+            }
+            self.update_image_widgets(ui);
+        }
+    }
+
+    pub(crate) fn move_to_prev_set(&mut self, ui: &mut Ui) {
+        if self.cursor.true_set_idx > 0 {
+            self.cursor.true_set_idx -= 1;
+            if let Some(cur_row_data) =
+                Self::fetch_row(&mut self.rows, self.cursor.true_set_idx, self.api_handle)
+            {
+                self.cursor.true_item_idx =
+                    self.cursor.adjusted_item_idx + cur_row_data.left_right_idx_adjustment;
+            }
+        }
+        self.update_image_widgets(ui);
+    }
+
+    pub(crate) fn move_to_next_set(&mut self, ui: &mut Ui) {
+        if self.cursor.true_set_idx < self.api_handle.get_num_of_sets().unwrap() - 1 {
+            self.cursor.true_set_idx += 1;
+            if let Some(cur_row_data) =
+                Self::fetch_row(&mut self.rows, self.cursor.true_set_idx, self.api_handle)
+            {
+                self.cursor.true_item_idx =
+                    self.cursor.adjusted_item_idx + cur_row_data.left_right_idx_adjustment;
+            }
+        }
+        self.update_image_widgets(ui);
     }
 }
 
+/// Represents where the cursor is at on the screen. By cursor, it really means what are the indices
+/// of the highlighted item.
 #[derive(Default)]
 struct Cursor {
-    set_idx: usize,
-    item_idx: usize,
+    true_set_idx: usize,
+    true_item_idx: usize,
+    adjusted_item_idx: usize,
+}
+
+struct HighlightedItemData {
+    img_id: Id,
+    w: f64,
+    h: f64,
+    true_set_idx: usize,
+    adjusted_item_idx: usize,
+    adjusted_set_idx: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
-    let (display, mut events_loop, mut ui) = build_display();
+    let (display, mut events_loop, mut ui) = helpers::build_display();
 
     let api_handle = {
         let mut a = api::Api::new();
@@ -368,8 +585,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut controller = DisplayController::new(&display, &api_handle, &mut ui);
     controller.initialize(&mut ui, &Cursor::default());
 
-    let mut item_idx = LeftRight(0);
-    let mut set_idx = TopDown(0);
     let mut navigation_debounce = Instant::now();
 
     'main: loop {
@@ -406,15 +621,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             },
                         ..
                     } => {
-                        if user_navigated(
-                            key_code,
-                            &mut item_idx,
-                            &mut set_idx,
-                            &mut navigation_debounce,
-                        ) {
-                            controller.navigate_to(set_idx.0, item_idx.0, &mut ui);
-                        } else {
-                            println!("event {:?}", key_code);
+                        if navigation_debounce.elapsed().as_millis()
+                            < NAVIGATION_KEYS_DEBOUNCE_THRESHOLD
+                        {
+                            break;
+                        }
+                        navigation_debounce = Instant::now();
+
+                        if key_code == VirtualKeyCode::Left {
+                            controller.move_current_set_left(&mut ui);
+                        } else if key_code == VirtualKeyCode::Right {
+                            controller.move_current_set_right(&mut ui);
+                        } else if key_code == VirtualKeyCode::Up {
+                            controller.move_to_prev_set(&mut ui);
+                        } else if key_code == VirtualKeyCode::Down {
+                            controller.move_to_next_set(&mut ui);
                         }
                     }
                     _ => (),
@@ -424,35 +645,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
-}
-
-fn user_navigated(
-    key_code: VirtualKeyCode,
-    item: &mut LeftRight,
-    set_num: &mut TopDown,
-    navigation_debounce: &mut Instant,
-) -> bool {
-    if (*navigation_debounce).elapsed().as_millis() < NAVIGATION_KEYS_DEBOUNCE_THRESHOLD {
-        return false;
-    }
-    *navigation_debounce = Instant::now();
-    if key_code == VirtualKeyCode::Left {
-        if (*item).0 != 0 {
-            (*item).0 -= 1;
-        }
-        return true;
-    } else if key_code == VirtualKeyCode::Right {
-        (*item).0 += 1;
-        return true;
-    } else if key_code == VirtualKeyCode::Up {
-        if (*set_num).0 != 0 {
-            (*set_num).0 -= 1;
-        }
-        return true;
-    } else if key_code == VirtualKeyCode::Down {
-        (*set_num).0 += 1;
-        return true;
-    }
-
-    return false;
 }

@@ -14,8 +14,6 @@ pub struct Api {
 const TITLE_NOT_FOUND: &str = "Title not found";
 const TILE_TYPE_DEFAULT: &str = "program";
 
-const S: &str = "https://prod-ripcut-delivery.disney-plus.net/v1/variant/disney/9F9C4A480357CD8D21E2C675B146D40782B92F570660B028AC7FA149E21B88D2/scale?format=jpeg&quality=90&scalingAlgorithm=lanczos3&width=500";
-
 #[derive(Debug)]
 pub struct SetData<'a> {
     entry: &'a Value,
@@ -115,11 +113,19 @@ impl Api {
         Ok(())
     }
 
-    /// Attempt to get the [`SetData`] for the given `set_num`
+    /// Attempt to get the [`SetData`] for the given `set_idx`
     ///
     pub fn get_set(&self, set_idx: usize) -> Option<SetData> {
         if let Some(data) = self.json_data.as_ref() {
-            let res = &data["data"]["StandardCollection"]["containers"][set_idx]["set"];
+            let ct = &data["data"]["StandardCollection"]["containers"];
+
+            if let Value::Array(arr) = ct {
+                if set_idx >= arr.len() {
+                    return None;
+                }
+            }
+
+            let res = &ct[set_idx]["set"];
             let set = SetData::new(res);
             Some(set)
         } else {
@@ -127,9 +133,14 @@ impl Api {
         }
     }
 
-    pub fn get_image(&self) -> Result<DynamicImage, Box<dyn std::error::Error>> {
-        let buf = reqwest::blocking::get(S)?.bytes().unwrap();
-        let img = ImageReader::with_format(Cursor::new(buf), ImageFormat::Jpeg).decode()?;
-        Ok(img)
+    pub fn get_num_of_sets(&self) -> Option<usize> {
+        if let Some(data) = self.json_data.as_ref() {
+            let ct = &data["data"]["StandardCollection"]["containers"];
+
+            if let Value::Array(arr) = ct {
+                return Some(arr.len());
+            }
+        }
+        None
     }
 }
