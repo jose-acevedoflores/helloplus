@@ -1,3 +1,11 @@
+//! ## Api
+//!
+//! The main responsibility of the [`Api`] crate is to abstract away the interactions with the backend.
+//! It's in charge of fetching and parsing the json data.
+//!
+//! ### Improvements
+//! - It could shed unused fields to lower the memory footprint.
+//! - It could provide some caching.
 use image::io::Reader as ImageReader;
 use image::{DynamicImage, ImageFormat};
 use log::info;
@@ -6,6 +14,7 @@ use reqwest::StatusCode;
 use serde_json::Value;
 use std::io::Cursor;
 
+/// Struct used to interact with the backend.
 pub struct Api {
     json_data: Option<Value>,
     //Consider a cached layer to avoid fetching resources already here.
@@ -14,6 +23,12 @@ pub struct Api {
 const TITLE_NOT_FOUND: &str = "Title not found";
 const TILE_TYPE_DEFAULT: &str = "program";
 
+/// Struct that encapsulates a given set's data.
+///
+/// Provides methods to interact with the data like:
+/// - getting the title
+/// - getting how many items are in this set
+/// - getting the image to display for a given item on this set
 #[derive(Debug)]
 pub struct SetData<'a> {
     entry: &'a Value,
@@ -70,7 +85,7 @@ impl<'a> SetData<'a> {
                         prev
                     }
                 })
-                .expect("TODO some tile data to be present");
+                .expect("some tile data to be present"); //TODO improve this error handling
 
             let tile_type = if let Value::Object(ref map) = tile_data {
                 map.keys().into_iter().last().unwrap().as_str()
@@ -85,7 +100,6 @@ impl<'a> SetData<'a> {
                 }
                 let buf = response.bytes()?;
                 let img = ImageReader::with_format(Cursor::new(buf), ImageFormat::Jpeg).decode()?;
-                // let img = img.resize(500, 220, FilterType::Lanczos3);
                 Ok(img)
             } else {
                 let err_msg = format!("No url found for item num: '{}'", item_num);
@@ -114,7 +128,6 @@ impl Api {
     }
 
     /// Attempt to get the [`SetData`] for the given `set_idx`
-    ///
     pub fn get_set(&self, set_idx: usize) -> Option<SetData> {
         if let Some(data) = self.json_data.as_ref() {
             let ct = &data["data"]["StandardCollection"]["containers"];
@@ -133,6 +146,8 @@ impl Api {
         }
     }
 
+    /// Returns the number of containers that were previously loaded.
+    /// Returns None if the api has not fetched any data.
     pub fn get_num_of_sets(&self) -> Option<usize> {
         if let Some(data) = self.json_data.as_ref() {
             let ct = &data["data"]["StandardCollection"]["containers"];

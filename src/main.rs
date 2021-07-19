@@ -1,6 +1,33 @@
 //! ## Hello+
 //!
 //! Clone of a streaming service homepage using [`conrod glium/winit`](https://github.com/PistonDevelopers/conrod)
+//!
+//! The basic idea is to load a simulated home page from some JSON data and populate the simulated
+//! 1920x1080 window.
+//!
+//! The idea is to keep around as few resources as possible while still allowing fluid navigation.
+//! To achieve this we are running vectors with fixed sizes to cache the minimum amount of data.
+//!
+//! It also uses an indexing scheme to allow the reuse slots inside the [Ids::imgs] and [Ids::titles] buffers.
+//! It consists of:
+//!  - having an `adjusted_set` index for the data set (corresponds to the rows) and an `adjusted_item` index
+//!    for an item within a dataset (corresponds to a specific image). These `adjusted`
+//!    indices never exceed a predetermined value. This value is calculated based on the size of the window
+//!    and the size of the individual items to make sure whatever the user is currently pointing to
+//!    is always in view.
+//!
+//! ### Improvements
+//! - [`DisplayController::rows`] and [`DisplayController::image_map`] are currently "unbounded".
+//!   They are both technically bound by how many sets/items are fetched from the json data. Note
+//!   that the [`rows`](DisplayController::rows) has an accompanying [`fetch_row`](DisplayController::fetch_row)
+//!   function meant to be used as a way to dynamically load the rows and bound it like [Ids::imgs]
+//! - [`SetRow::cached_img_id`] is also unbounded and could be set so that it follows the [Ids::imgs] pattern.
+//! - Currently, at start time, everything is loaded in one shot. It would be better to
+//!   break that out to work alongside the [`EventLoop`] to load rows dynamically to give the user some quick feedback.
+//!
+#![allow(rustdoc::private_intra_doc_links)]
+#![warn(missing_docs)]
+
 #[macro_use]
 extern crate conrod;
 use api::{Api, SetData};
@@ -39,7 +66,20 @@ const ROW_TOP_MARGIN: f64 = 70.0;
 const ROW_HEIGHT: f64 = 290.0;
 
 widget_ids!(
-    /// Hold the [`Id`]s for the row titles and the images
+    /// Hold the [`Id`]s for the row titles and the images.
+    /// Note that `imgs` length is [`NUM_OF_CACHED_IMAGES`].
+    ///
+    /// The scheme used for the `imgs` field is that continuous chunks (sized [`ROW_STRIDE`]) of data are used
+    /// to store the images in view.
+    ///
+    /// For example:
+    ///  - With  [`NUM_ROWS`] set to 4 and [`ROW_STRIDE`] set to 6, `imgs` will have 24 elements.
+    ///  - This produces an array that looks like:
+    ///
+    /// | 0, 1, 2, 3, 4, 5, | 6, 7, 8, 9, 10, 11,| 12, 13, 14, 15, 16, 17,| 18, 19, 20, 21, 22, 23 |
+    /// | ----------------- | ------------------ | ---------------------- | ---------------------- |
+    /// | indices for row 0 |  indices for row 1 |   indices for row 2    |   indices for row 3    |
+    ///
     struct Ids {
         titles[],
         imgs[]
@@ -53,6 +93,7 @@ pub struct EventLoop {
 }
 
 impl EventLoop {
+    /// Constructor.
     pub fn new() -> Self {
         EventLoop {
             last_update: std::time::Instant::now(),
@@ -90,6 +131,7 @@ impl EventLoop {
     }
 }
 
+/// Simple holder to keep track of the img_ids we've already placed in the [`image_map`](DisplayController::image_map)
 struct CachedImgData {
     img_id: Id,
     w: f64,
@@ -116,7 +158,8 @@ struct SetRow<'a> {
     /// Unique id for this set of data.
     true_set_idx: usize,
     /// Cached [`Id`] keys used to map the image data stored in the [`image_map`](DisplayController::image_map)
-    /// IMPROVEMENT: treat as a fixed sized array to only keep the
+    ///
+    /// IMPROVEMENT: treat as a fixed sized array to only keep the items in view.
     cached_img_id: Vec<CachedImgData>,
     /// Combined with the `adjusted_item_idx` it produces the `true_item_idx` for this specific row.
     left_right_idx_adjustment: usize,
@@ -139,7 +182,7 @@ impl<'a> SetRow<'a> {
     /// Shift right on a given row. Returns a bool because it needs to check that row's specific
     /// item count.
     /// # Arguments
-    /// * `adjusted_item_idx`: this is the index that stays between the 0 to [`ROW_STRIDE`]-1 range.
+    /// * `adjusted_item_idx`: this is the canvas index for the item (always between 0 and [`ROW_STRIDE`]-1).
     /// * `true_item_idx`: this is the full index into this row's items.
     fn shift_right(&mut self, adjusted_item_idx: usize, true_item_idx: usize) -> bool {
         if (true_item_idx + 1) < self.set_data.get_item_count() {
@@ -154,7 +197,7 @@ impl<'a> SetRow<'a> {
 
     ///
     /// # Arguments
-    /// * `adjusted_item_idx`: this is the index that stays between the 0 to [`ROW_STRIDE`]-1 range.
+    /// * `adjusted_item_idx`: this is the canvas index for the item (always between 0 and [`ROW_STRIDE`]-1).
     fn shift_left(&mut self, adjusted_item_idx: usize) {
         if self.left_right_idx_adjustment > 0 {
             if adjusted_item_idx < 2 {
@@ -190,11 +233,11 @@ impl<'a> SetRow<'a> {
     /// Sets the widget to display the appropriate image for this row given the `adjusted_*` indices.
     /// Returns true if this image should be highlighted (scaled up).
     ///
-    /// NOTE: The reason we don't set the scaled up widget here is because when the image scales up
-    /// it takes some space from the previous and next image. If we set the scale here then the next image
+    /// NOTE: The reason we don't set the scaled up widget here is because when the image scales up,
+    /// it takes some space from the previous and next image. If we set the scaled up image here then the next image
     /// will overlap and it will appear on top of the currently highlighted image. The scaled up
     /// image is drawn last to make sure it will be on top.
-    /// # Argumets
+    /// # Arguments
     /// * `adjusted_item_idx`: this is the canvas index for the item (always between 0 and [`ROW_STRIDE`]-1).
     /// * `adjusted_set_idx`: This is the canvas index for this set of data. This index is adjusted to
     ///    stay between 0 and [`NUM_ROWS`]-1
@@ -364,7 +407,7 @@ impl<'a> DisplayController<'a> {
         }
     }
 
-    /// Initialize the DisplayController. This is meant to be called once at start of the program.
+    /// Initialize the [`DisplayController`]. This is meant to be called once at start of the program.
     fn initialize(&mut self, ui: &mut Ui, cursor: &Cursor) {
         if self.initialized {
             return;
@@ -373,7 +416,7 @@ impl<'a> DisplayController<'a> {
         //NOTE: in this method, `true` amd `adjusted` indices are the same.
         let ui = &mut ui.set_widgets();
         for set_idx in self.prev_visible_range.clone() {
-            let row_data = self.api_handle.get_set(set_idx).expect("TODO testing");
+            let row_data = self.api_handle.get_set(set_idx).unwrap();
             let mut set_row = SetRow::new(row_data, set_idx);
             for item_idx in 0..ROW_STRIDE {
                 set_row.show(
@@ -392,22 +435,22 @@ impl<'a> DisplayController<'a> {
         }
     }
 
-    /// This function takes the set_idx and produces the range of sets that are going to be visible
+    /// This function takes the `true_set_index` and produces the range of sets that are going to be visible
     /// taking into account the expected number of visible rows.
     ///
     /// For example:
-    ///  - with NUM_ROWS set to 4
+    ///  - with [`NUM_ROWS`] set to 4
     ///  - if set set_idx 0 through 2 the visible range is 0 to 4
     ///  - if user goes down 3 times now set_idx is 3 and visible range is 1 to 5
     ///  - if from 3 it goes to 4 then visible range now is 2 to 6
     ///  - if user now goes BACK so set_idx is back to 3 the range is still 2 to 6
     ///    This helps ease the transition since it won't jump all the rows back
-    fn visible_set_range(&mut self, set_idx: usize) -> Range<usize> {
-        if (set_idx - self.prev_visible_range.start) == 1 {
+    fn visible_set_range(&mut self, true_set_index: usize) -> Range<usize> {
+        if (true_set_index - self.prev_visible_range.start) == 1 {
             return self.prev_visible_range.clone();
         }
-        let new_range = if set_idx + 2 > NUM_ROWS {
-            let shift = (set_idx + 2) - NUM_ROWS;
+        let new_range = if true_set_index + 2 > NUM_ROWS {
+            let shift = (true_set_index + 2) - NUM_ROWS;
             shift..(shift + NUM_ROWS)
         } else {
             0..NUM_ROWS
@@ -417,7 +460,7 @@ impl<'a> DisplayController<'a> {
         new_range
     }
 
-    /// This associated function is meant to be the access point of the Self.rows vector.
+    /// This associated function is meant to be the access point of the [`rows`](DisplayController::rows) vector.
     fn fetch_row<'b>(
         rows: &'b mut Vec<SetRow<'a>>,
         true_set_idx: usize,
@@ -560,6 +603,7 @@ struct Cursor {
     adjusted_item_idx: usize,
 }
 
+/// Encapsulates the data of the item that should be highlighted so that it can be drawn last.
 struct HighlightedItemData {
     img_id: Id,
     w: f64,
