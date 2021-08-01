@@ -42,6 +42,18 @@ pub fn load_img_not_found() -> DynamicImage {
     img.resize(500, 220, FilterType::Lanczos3)
 }
 
+/// Load the "placeholder" png to use when artwork can't be loaded just yet.
+///
+/// Located in the assets folder.
+pub fn load_placeholder_img() -> DynamicImage {
+    let assets = find_folder::Search::ParentsThenKids(3, 3)
+        .for_folder("assets")
+        .unwrap();
+    let path = assets.join("images/placeholder.png");
+    let img = image::open(&std::path::Path::new(&path)).unwrap();
+    img.resize(500, 220, FilterType::Lanczos3)
+}
+
 /// Build the [`glium Display`](Display) and [`EventsLoop`] for the window.
 pub fn build_display() -> (Display, EventsLoop, Ui) {
     let events_loop = glium::glutin::EventsLoop::new();

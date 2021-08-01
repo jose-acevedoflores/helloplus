@@ -37,9 +37,13 @@ use conrod::glium::Display;
 use conrod::image::Id;
 use conrod::image::Map;
 use conrod::{widget, Colorable, Positionable, Sizeable, Ui, UiCell, Widget};
+use image::DynamicImage;
 use log::{debug, info};
-use std::ops::Range;
+use std::cell::RefCell;
+use std::ops::{Deref, Range};
+use std::rc::Rc;
 use std::time::Instant;
+
 mod helpers;
 
 const DISPLAY_WIDTH: u32 = 1920;
@@ -54,6 +58,11 @@ const NUM_ROWS: usize = 4;
 const ROW_STRIDE: usize = 6;
 /// This represents the number of images available to draw. Used for various alignments and as the total size of the [Ids::imgs] field.
 const NUM_OF_CACHED_IMAGES: usize = NUM_ROWS * ROW_STRIDE;
+/// This field represents the number of ROWS kept in memory.
+const BUFFERED_ROWS: usize = 6;
+/// This field represents how many images are loaded on a single loop of the MAIN_LOOP.
+/// Used to improve responsiveness.
+const SINGLE_LOOP_MAX_LOAD: usize = 2;
 
 // **** Start of pixel alignment consts.
 /// Margin to space out the thumbnails. Used to the left and right of the images.
@@ -90,13 +99,15 @@ widget_ids!(
 /// It will throttle to target 60fps rate.
 pub struct EventLoop {
     last_update: std::time::Instant,
+    img_load_pending: Rc<ImgLoadingNotifier>,
 }
 
 impl EventLoop {
     /// Constructor.
-    pub fn new() -> Self {
-        EventLoop {
+    pub fn new(img_load_pending: Rc<ImgLoadingNotifier>) -> Self {
+        Self {
             last_update: std::time::Instant::now(),
+            img_load_pending,
         }
     }
 
@@ -117,8 +128,7 @@ impl EventLoop {
         // Collect all pending events.
         let mut events = Vec::new();
         events_loop.poll_events(|event| events.push(event));
-
-        if events.is_empty() {
+        if events.is_empty() && !*self.img_load_pending.needs_to_load.borrow() {
             events_loop.run_forever(|event| {
                 events.push(event);
                 glium::glutin::ControlFlow::Break
@@ -230,6 +240,36 @@ impl<'a> SetRow<'a> {
         adjusted_set_idx * ROW_STRIDE + adjusted_item_idx
     }
 
+    fn get_item(
+        &self,
+        true_item_idx: usize,
+        img_load_pending: &ImgLoadingNotifier,
+        p_id: &Id,
+    ) -> Result<Option<DynamicImage>, Box<dyn std::error::Error>> {
+        let is_cached_but_is_placeholder = self.cached_img_id.get(true_item_idx).is_some()
+            && &self
+                .cached_img_id
+                .get(true_item_idx)
+                .as_ref()
+                .unwrap()
+                .img_id
+                == p_id;
+
+        if (is_cached_but_is_placeholder || self.cached_img_id.get(true_item_idx).is_none())
+            && img_load_pending.single_loop_load_count.borrow().deref() < &SINGLE_LOOP_MAX_LOAD
+        {
+            let img = self
+                .set_data
+                .get_home_tile_image(true_item_idx)
+                .map(|d| Some(d));
+            *img_load_pending.single_loop_load_count.borrow_mut() += 1;
+            img
+        } else {
+            *img_load_pending.needs_to_load.borrow_mut() = true;
+            Ok(None)
+        }
+    }
+
     /// Sets the widget to display the appropriate image for this row given the `adjusted_*` indices.
     /// Returns true if this image should be highlighted (scaled up).
     ///
@@ -245,34 +285,67 @@ impl<'a> SetRow<'a> {
         &mut self,
         display: &Display,
         ui: &mut UiCell,
-        image_map: &mut Map<glium::texture::Texture2d>,
-        ids: &Ids,
+        disp_ctrl_img_data: &mut DispCtrlImgData,
         cursor: &Cursor,
-        nf_id: &Id,
         adjusted_item_idx: usize,
         adjusted_set_idx: usize,
+        img_load_pending: &ImgLoadingNotifier,
     ) -> Option<HighlightedItemData> {
         let true_item_idx = adjusted_item_idx + self.left_right_idx_adjustment;
 
-        if self.cached_img_id.get(true_item_idx).is_none() {
-            let img = self.set_data.get_home_tile_image(true_item_idx);
+        let image_map = &mut disp_ctrl_img_data.image_map;
+        let ids = &disp_ctrl_img_data.ids;
 
-            if let Ok(img) = img {
-                let img = helpers::load_img(display, img);
-                let (w, h) = (img.get_width(), img.get_height().unwrap());
-                let img_id = image_map.insert(img);
-                let w = (w as f64) * IMAGE_SCALE_DOWN_FACTOR;
-                let h = (h as f64) * IMAGE_SCALE_DOWN_FACTOR;
-                info!("put img {:?} ar {}", img_id, w / h);
-                self.cached_img_id.push(CachedImgData::new(img_id, w, h));
-            } else {
-                self.cached_img_id.push(CachedImgData::new(
-                    nf_id.clone(),
-                    500.0 * 0.75,
-                    220.0 * 0.75,
-                ));
+        let is_cached_but_is_placeholder = self.cached_img_id.get(true_item_idx).is_some()
+            && &self
+                .cached_img_id
+                .get(true_item_idx)
+                .as_ref()
+                .unwrap()
+                .img_id
+                == &disp_ctrl_img_data.placeholder_id;
+
+        if self.cached_img_id.get(true_item_idx).is_none() || is_cached_but_is_placeholder {
+            let img = self.get_item(
+                true_item_idx,
+                img_load_pending,
+                &disp_ctrl_img_data.placeholder_id,
+            );
+
+            match img {
+                Ok(Some(img)) => {
+                    let img = helpers::load_img(display, img);
+                    let (w, h) = (img.get_width(), img.get_height().unwrap());
+                    let img_id = image_map.insert(img);
+                    let w = (w as f64) * IMAGE_SCALE_DOWN_FACTOR;
+                    let h = (h as f64) * IMAGE_SCALE_DOWN_FACTOR;
+                    info!("put img {:?} ar {}", img_id, w / h);
+                    if is_cached_but_is_placeholder {
+                        self.cached_img_id[true_item_idx] = CachedImgData::new(img_id, w, h);
+                    } else {
+                        self.cached_img_id.push(CachedImgData::new(img_id, w, h));
+                    }
+                }
+                Ok(None) => {
+                    if !is_cached_but_is_placeholder {
+                        self.cached_img_id.push(CachedImgData::new(
+                            disp_ctrl_img_data.placeholder_id,
+                            500.0 * 0.75,
+                            220.0 * 0.75,
+                        ));
+                    }
+                }
+                Err(_) => {
+                    let img =
+                        CachedImgData::new(disp_ctrl_img_data.nf_id, 500.0 * 0.75, 220.0 * 0.75);
+                    if is_cached_but_is_placeholder {
+                        self.cached_img_id[true_item_idx] = img;
+                    } else {
+                        self.cached_img_id.push(img);
+                    }
+                }
             }
-        };
+        }
 
         // We know that from the previous if block there will be an item at true_item_idx now
         let data = self.cached_img_id.get(true_item_idx).unwrap();
@@ -367,6 +440,14 @@ impl<'a> SetRow<'a> {
     }
 }
 
+/// Group the Image Id related fields
+struct DispCtrlImgData {
+    ids: Ids,
+    nf_id: Id,
+    placeholder_id: Id,
+    image_map: Map<glium::texture::Texture2d>,
+}
+
 /// Main structure controlling the widgets that should be displayed.
 /// Its main responsibility is interpreting the navigation commands (Left, Right, Up or Down)
 /// and adjust the internal state to reflect what should be displayed.
@@ -374,16 +455,20 @@ struct DisplayController<'a> {
     initialized: bool,
     rows: Vec<SetRow<'a>>,
     display: &'a Display,
-    image_map: Map<glium::texture::Texture2d>,
+    disp_ctrl_img_data: DispCtrlImgData,
     api_handle: &'a Api,
-    ids: Ids,
-    nf_id: Id,
     prev_visible_range: Range<usize>,
     cursor: Cursor,
+    img_load_pending: &'a ImgLoadingNotifier,
 }
 
 impl<'a> DisplayController<'a> {
-    fn new(display: &'a Display, api_handle: &'a Api, ui: &mut Ui) -> Self {
+    fn new(
+        display: &'a Display,
+        api_handle: &'a Api,
+        ui: &mut Ui,
+        img_load_pending: &'a ImgLoadingNotifier,
+    ) -> Self {
         let mut ids = Ids::new(ui.widget_id_generator());
         ids.imgs
             .resize(NUM_OF_CACHED_IMAGES, &mut ui.widget_id_generator());
@@ -394,16 +479,26 @@ impl<'a> DisplayController<'a> {
         let img = helpers::load_img(display, nf);
         let nf_id = image_map.insert(img);
 
-        Self {
-            initialized: false,
-            rows: Vec::new(),
-            display,
+        let placeholder = helpers::load_placeholder_img();
+        let placeholder_img = helpers::load_img(display, placeholder);
+        let placeholder_id = image_map.insert(placeholder_img);
+
+        let disp_ctrl_img_data = DispCtrlImgData {
             image_map,
-            api_handle,
             ids,
             nf_id,
+            placeholder_id,
+        };
+
+        Self {
+            initialized: false,
+            rows: Vec::with_capacity(BUFFERED_ROWS),
+            display,
+            disp_ctrl_img_data,
+            api_handle,
             prev_visible_range: 0..NUM_ROWS,
             cursor: Cursor::default(),
+            img_load_pending,
         }
     }
 
@@ -422,15 +517,14 @@ impl<'a> DisplayController<'a> {
                 set_row.show(
                     self.display,
                     ui,
-                    &mut self.image_map,
-                    &self.ids,
+                    &mut self.disp_ctrl_img_data,
                     &cursor,
-                    &self.nf_id,
                     item_idx,
                     set_idx,
+                    self.img_load_pending,
                 );
             }
-            set_row.show_row_title(set_idx, &self.ids, ui);
+            set_row.show_row_title(set_idx, &self.disp_ctrl_img_data.ids, ui);
             self.rows.push(set_row);
         }
     }
@@ -466,8 +560,14 @@ impl<'a> DisplayController<'a> {
         true_set_idx: usize,
         api_handle: &'a Api,
     ) -> Option<&'b mut SetRow<'a>> {
-        if rows.get_mut(true_set_idx).is_some() {
-            return rows.get_mut(true_set_idx);
+        if rows.get_mut(true_set_idx % BUFFERED_ROWS).is_some()
+            && rows
+                .get_mut(true_set_idx % BUFFERED_ROWS)
+                .unwrap()
+                .true_set_idx
+                == true_set_idx
+        {
+            return rows.get_mut(true_set_idx % BUFFERED_ROWS);
         }
         // we know res is none so need to fetch the data for this set.
         let set_row_opt = if let Some(row_data) = api_handle.get_set(true_set_idx) {
@@ -477,8 +577,12 @@ impl<'a> DisplayController<'a> {
             None
         };
         if let Some(set_row) = set_row_opt {
-            rows.push(set_row);
-            rows.last_mut()
+            if true_set_idx % BUFFERED_ROWS >= rows.len() {
+                rows.push(set_row);
+            } else {
+                rows[true_set_idx % BUFFERED_ROWS] = set_row;
+            }
+            rows.get_mut(true_set_idx % BUFFERED_ROWS)
         } else {
             None
         }
@@ -487,7 +591,7 @@ impl<'a> DisplayController<'a> {
     fn update_image_widgets(&mut self, ui: &mut Ui) {
         info!(
             "Image map size {}. idx:{}",
-            self.image_map.len(),
+            self.disp_ctrl_img_data.image_map.len(),
             self.cursor.true_item_idx
         );
         let ui = &mut ui.set_widgets();
@@ -504,18 +608,17 @@ impl<'a> DisplayController<'a> {
                 let found_highlighted = set_row.show(
                     self.display,
                     ui,
-                    &mut self.image_map,
-                    &self.ids,
+                    &mut self.disp_ctrl_img_data,
                     &self.cursor,
-                    &self.nf_id,
                     adjusted_item_idx,
                     adjusted_set_idx,
+                    self.img_load_pending,
                 );
                 if found_highlighted.is_some() {
                     highlighted_data = found_highlighted;
                 }
             }
-            set_row.show_row_title(adjusted_set_idx, &self.ids, ui);
+            set_row.show_row_title(adjusted_set_idx, &self.disp_ctrl_img_data.ids, ui);
         }
 
         if let Some(HighlightedItemData {
@@ -537,7 +640,7 @@ impl<'a> DisplayController<'a> {
                     h,
                     adjusted_set_idx,
                     adjusted_item_idx,
-                    &self.ids,
+                    &self.disp_ctrl_img_data.ids,
                     ui,
                 );
             }
@@ -613,8 +716,22 @@ struct HighlightedItemData {
     adjusted_set_idx: usize,
 }
 
+
+/// Struct to communicate to the [`EventLoop`] that there is still data to be loaded.
+pub struct ImgLoadingNotifier {
+    needs_to_load: RefCell<bool>,
+    single_loop_load_count: RefCell<usize>,
+}
+
+impl ImgLoadingNotifier {
+    fn reset(&self) {
+        *self.single_loop_load_count.borrow_mut() = 0;
+        *self.needs_to_load.borrow_mut() = false;
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    env_logger::builder().format_timestamp_millis().init();
     let (display, mut events_loop, mut ui) = helpers::build_display();
 
     let api_handle = {
@@ -622,23 +739,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         a.load_home_data()?;
         a
     };
+    let img_load_pending = Rc::new(ImgLoadingNotifier {
+        needs_to_load: RefCell::new(true),
+        single_loop_load_count: RefCell::new(0),
+    });
 
     let mut renderer = conrod::backend::glium::Renderer::new(&display).unwrap();
-    let mut event_loop = EventLoop::new();
 
-    let mut controller = DisplayController::new(&display, &api_handle, &mut ui);
+    let mut controller = DisplayController::new(&display, &api_handle, &mut ui, &img_load_pending);
     controller.initialize(&mut ui, &Cursor::default());
+
+    let mut event_loop = EventLoop::new(Rc::clone(&img_load_pending));
 
     let mut navigation_debounce = Instant::now();
 
     'main: loop {
         // Render the `Ui` and then display it on the screen.
         if let Some(primitives) = ui.draw_if_changed() {
-            renderer.fill(&display, primitives, &controller.image_map);
+            renderer.fill(
+                &display,
+                primitives,
+                &controller.disp_ctrl_img_data.image_map,
+            );
             let mut target = display.draw();
             target.clear_color(0.0, 0.0, 0.013, 1.0);
             renderer
-                .draw(&display, &mut target, &controller.image_map)
+                .draw(
+                    &display,
+                    &mut target,
+                    &controller.disp_ctrl_img_data.image_map,
+                )
                 .unwrap();
             target.finish().unwrap();
         }
@@ -686,6 +816,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 _ => (),
             }
+        }
+        if *img_load_pending.needs_to_load.borrow() {
+
+            img_load_pending.reset();
+            controller.update_image_widgets(&mut ui);
         }
     }
     Ok(())
