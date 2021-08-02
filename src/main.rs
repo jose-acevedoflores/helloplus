@@ -37,8 +37,7 @@ use conrod::glium::Display;
 use conrod::image::Id;
 use conrod::image::Map;
 use conrod::{widget, Colorable, Positionable, Sizeable, Ui, UiCell, Widget};
-use image::DynamicImage;
-use log::{debug, info};
+use log::{debug, info, trace};
 use std::cell::RefCell;
 use std::ops::{Deref, Range};
 use std::rc::Rc;
@@ -132,6 +131,7 @@ impl EventLoop {
         let mut events = Vec::new();
         events_loop.poll_events(|event| events.push(event));
         if events.is_empty() && !*self.img_load_pending.needs_to_load.borrow() {
+            debug!("parking until next event");
             events_loop.run_forever(|event| {
                 events.push(event);
                 glium::glutin::ControlFlow::Break
@@ -181,7 +181,7 @@ struct SetRow<'a> {
 impl<'a> SetRow<'a> {
     /// Constructor.
     fn new(set_data: SetData<'a>, true_set_idx: usize) -> Self {
-        debug!("Initialized Set row: {:?}", set_data);
+        trace!("Initialized Set row: {:?}", set_data);
         let title = set_data.get_title();
         Self {
             set_data,
@@ -381,7 +381,7 @@ impl<'a> SetRow<'a> {
             ui,
         );
 
-        // Return true if this item needs to be scaled up (highlighted)
+        // Return 'Some' if this item needs to be scaled up (highlighted)
         hd
     }
 
@@ -760,8 +760,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut navigation_debounce = Instant::now();
 
     'main: loop {
+        debug!("Main loop top");
         // Render the `Ui` and then display it on the screen.
         if let Some(primitives) = ui.draw_if_changed() {
+            debug!("ui needs redraw");
             renderer.fill(
                 &display,
                 primitives,
