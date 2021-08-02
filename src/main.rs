@@ -76,6 +76,16 @@ const ROW_HEIGHT: f64 = 290.0;
 const PLACEHOLDER_AND_NOT_FOUND_SCALED_W: f64 = 500.0 * IMAGE_SCALE_DOWN_FACTOR;
 const PLACEHOLDER_AND_NOT_FOUND_SCALED_H: f64 = 220.0 * IMAGE_SCALE_DOWN_FACTOR;
 
+struct AdjustedIndices {
+    adjusted_set_idx: usize,
+    adjusted_item_idx: usize,
+}
+
+struct Dimensions {
+    w: f64,
+    h: f64,
+}
+
 widget_ids!(
     /// Hold the [`Id`]s for the row titles and the images.
     /// Note that `imgs` length is [`NUM_OF_CACHED_IMAGES`].
@@ -212,10 +222,8 @@ impl<'a> SetRow<'a> {
     /// # Arguments
     /// * `adjusted_item_idx`: this is the canvas index for the item (always between 0 and [`ROW_STRIDE`]-1).
     fn shift_left(&mut self, adjusted_item_idx: usize) {
-        if self.left_right_idx_adjustment > 0 {
-            if adjusted_item_idx < 2 {
-                self.left_right_idx_adjustment -= 1;
-            }
+        if self.left_right_idx_adjustment > 0 && adjusted_item_idx < 2 {
+            self.left_right_idx_adjustment -= 1;
         }
     }
 
@@ -284,13 +292,13 @@ impl<'a> SetRow<'a> {
             img_load_pending.single_loop_load_count.borrow().deref() < &SINGLE_LOOP_MAX_LOAD;
 
         if is_cached_already {
-            let is_placeholder = &self
+            let is_placeholder = self
                 .cached_img_id
                 .get(true_item_idx)
                 .as_ref()
                 .unwrap()
                 .img_id
-                == &disp_ctrl_img_data.placeholder_id;
+                == disp_ctrl_img_data.placeholder_id;
 
             if is_placeholder && can_load_more {
                 let cached_img = self.get_home_tile_or_not_found(
@@ -344,10 +352,14 @@ impl<'a> SetRow<'a> {
         ui: &mut UiCell,
         disp_ctrl_img_data: &mut DispCtrlImgData,
         cursor: &Cursor,
-        adjusted_item_idx: usize,
-        adjusted_set_idx: usize,
+        adjusted_indices: AdjustedIndices,
         img_load_pending: &ImgLoadingNotifier,
     ) -> Option<HighlightedItemData> {
+        let AdjustedIndices {
+            adjusted_set_idx,
+            adjusted_item_idx,
+        } = adjusted_indices;
+
         let true_item_idx = adjusted_item_idx + self.left_right_idx_adjustment;
 
         self.populate_cache_if_needed(display, true_item_idx, disp_ctrl_img_data, img_load_pending);
@@ -371,12 +383,17 @@ impl<'a> SetRow<'a> {
                 None
             };
 
-        self.draw_image(
-            data.img_id,
-            data.w,
-            data.h,
+        let adjusted_indices = AdjustedIndices {
             adjusted_set_idx,
             adjusted_item_idx,
+        };
+        self.draw_image(
+            data.img_id,
+            Dimensions {
+                w: data.w,
+                h: data.h,
+            },
+            adjusted_indices,
             ids,
             ui,
         );
@@ -388,13 +405,17 @@ impl<'a> SetRow<'a> {
     fn draw_image(
         &self,
         img_id: Id,
-        w: f64,
-        h: f64,
-        adjusted_set_idx: usize,
-        adjusted_item_idx: usize,
+        dims: Dimensions,
+        adjusted_indices: AdjustedIndices,
         ids: &Ids,
         ui: &mut UiCell,
     ) {
+        let Dimensions { w, h } = dims;
+        let AdjustedIndices {
+            adjusted_set_idx,
+            adjusted_item_idx,
+        } = adjusted_indices;
+
         widget::Image::new(img_id)
             .w_h(w, h)
             .top_left_with_margins_on(
@@ -412,13 +433,17 @@ impl<'a> SetRow<'a> {
     fn draw_image_highlighted(
         &self,
         img_id: Id,
-        w: f64,
-        h: f64,
-        adjusted_set_idx: usize,
-        adjusted_item_idx: usize,
+        dims: Dimensions,
+        adjusted_indices: AdjustedIndices,
         ids: &Ids,
         ui: &mut UiCell,
     ) {
+        let Dimensions { w, h } = dims;
+        let AdjustedIndices {
+            adjusted_set_idx,
+            adjusted_item_idx,
+        } = adjusted_indices;
+
         widget::Image::new(img_id)
             .w_h(w * IMAGE_SCALE_UP_FACTOR, h * IMAGE_SCALE_UP_FACTOR)
             .top_left_with_margins_on(
@@ -491,10 +516,10 @@ impl<'a> DisplayController<'a> {
         let placeholder_id = image_map.insert(placeholder_img);
 
         let disp_ctrl_img_data = DispCtrlImgData {
-            image_map,
             ids,
             nf_id,
             placeholder_id,
+            image_map,
         };
 
         Self {
@@ -521,13 +546,16 @@ impl<'a> DisplayController<'a> {
             let row_data = self.api_handle.get_set(set_idx).unwrap();
             let mut set_row = SetRow::new(row_data, set_idx);
             for item_idx in 0..ROW_STRIDE {
+                let adjusted_indices = AdjustedIndices {
+                    adjusted_set_idx: set_idx,
+                    adjusted_item_idx: item_idx,
+                };
                 set_row.show(
                     self.display,
                     ui,
                     &mut self.disp_ctrl_img_data,
                     &cursor,
-                    item_idx,
-                    set_idx,
+                    adjusted_indices,
                     self.img_load_pending,
                 );
             }
@@ -612,13 +640,16 @@ impl<'a> DisplayController<'a> {
             }
             let set_row = fetched.unwrap();
             for adjusted_item_idx in 0..ROW_STRIDE {
+                let adjusted_indices = AdjustedIndices {
+                    adjusted_set_idx,
+                    adjusted_item_idx,
+                };
                 let found_highlighted = set_row.show(
                     self.display,
                     ui,
                     &mut self.disp_ctrl_img_data,
                     &self.cursor,
-                    adjusted_item_idx,
-                    adjusted_set_idx,
+                    adjusted_indices,
                     self.img_load_pending,
                 );
                 if found_highlighted.is_some() {
@@ -641,12 +672,15 @@ impl<'a> DisplayController<'a> {
             if let Some(highlighted_row) =
                 Self::fetch_row(&mut self.rows, true_set_idx, self.api_handle)
             {
-                highlighted_row.draw_image_highlighted(
-                    img_id,
-                    w,
-                    h,
+                let dim = Dimensions { w, h };
+                let idx = AdjustedIndices {
                     adjusted_set_idx,
                     adjusted_item_idx,
+                };
+                highlighted_row.draw_image_highlighted(
+                    img_id,
+                    dim,
+                    idx,
                     &self.disp_ctrl_img_data.ids,
                     ui,
                 );

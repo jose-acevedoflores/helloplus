@@ -3,7 +3,6 @@ use conrod::backend::glium::glium;
 use conrod::glium::glutin::EventsLoop;
 use conrod::glium::Display;
 use conrod::Ui;
-use find_folder;
 use image::imageops::FilterType;
 use image::DynamicImage;
 
@@ -15,8 +14,8 @@ pub fn load_img(display: &glium::Display, dyn_img: DynamicImage) -> glium::textu
         &rgba_image.into_raw(),
         image_dimensions,
     );
-    let texture = glium::texture::Texture2d::new(display, raw_image).unwrap();
-    texture
+
+    glium::texture::Texture2d::new(display, raw_image).unwrap()
 }
 
 /// Load the fonts for this ui.
