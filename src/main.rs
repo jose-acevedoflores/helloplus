@@ -74,6 +74,9 @@ const IMAGE_SCALE_UP_FACTOR: f64 = 1.15;
 const ROW_TOP_MARGIN: f64 = 70.0;
 const ROW_HEIGHT: f64 = 290.0;
 
+const PLACEHOLDER_AND_NOT_FOUND_SCALED_W: f64 = 500.0 * IMAGE_SCALE_DOWN_FACTOR;
+const PLACEHOLDER_AND_NOT_FOUND_SCALED_H: f64 = 220.0 * IMAGE_SCALE_DOWN_FACTOR;
+
 widget_ids!(
     /// Hold the [`Id`]s for the row titles and the images.
     /// Note that `imgs` length is [`NUM_OF_CACHED_IMAGES`].
@@ -240,33 +243,87 @@ impl<'a> SetRow<'a> {
         adjusted_set_idx * ROW_STRIDE + adjusted_item_idx
     }
 
-    fn get_item(
+    fn get_home_tile_or_not_found(
         &self,
+        display: &Display,
         true_item_idx: usize,
+        image_map: &mut Map<glium::texture::Texture2d>,
+        nf_id: &Id,
+    ) -> CachedImgData {
+        let img = self.set_data.get_home_tile_image(true_item_idx);
+
+        if let Ok(img) = img {
+            let img = helpers::load_img(display, img);
+            let (w, h) = (img.get_width(), img.get_height().unwrap());
+            let img_id = image_map.insert(img);
+            let w = (w as f64) * IMAGE_SCALE_DOWN_FACTOR;
+            let h = (h as f64) * IMAGE_SCALE_DOWN_FACTOR;
+            info!("put img {:?} ar {}", img_id, w / h);
+            CachedImgData::new(img_id, w, h)
+        } else {
+            CachedImgData::new(
+                *nf_id,
+                PLACEHOLDER_AND_NOT_FOUND_SCALED_W,
+                PLACEHOLDER_AND_NOT_FOUND_SCALED_H,
+            )
+        }
+    }
+
+    fn populate_cache_if_needed(
+        &mut self,
+        display: &Display,
+        true_item_idx: usize,
+        disp_ctrl_img_data: &mut DispCtrlImgData,
         img_load_pending: &ImgLoadingNotifier,
-        p_id: &Id,
-    ) -> Result<Option<DynamicImage>, Box<dyn std::error::Error>> {
-        let is_cached_but_is_placeholder = self.cached_img_id.get(true_item_idx).is_some()
-            && &self
+    ) {
+        let image_map = &mut disp_ctrl_img_data.image_map;
+
+        let is_cached_already = self.cached_img_id.get(true_item_idx).is_some();
+
+        let can_load_more =
+            img_load_pending.single_loop_load_count.borrow().deref() < &SINGLE_LOOP_MAX_LOAD;
+
+        if is_cached_already {
+            let is_placeholder = &self
                 .cached_img_id
                 .get(true_item_idx)
                 .as_ref()
                 .unwrap()
                 .img_id
-                == p_id;
+                == &disp_ctrl_img_data.placeholder_id;
 
-        if (is_cached_but_is_placeholder || self.cached_img_id.get(true_item_idx).is_none())
-            && img_load_pending.single_loop_load_count.borrow().deref() < &SINGLE_LOOP_MAX_LOAD
-        {
-            let img = self
-                .set_data
-                .get_home_tile_image(true_item_idx)
-                .map(|d| Some(d));
+            if is_placeholder && can_load_more {
+                let cached_img = self.get_home_tile_or_not_found(
+                    display,
+                    true_item_idx,
+                    image_map,
+                    &disp_ctrl_img_data.nf_id,
+                );
+
+                self.cached_img_id[true_item_idx] = cached_img;
+                *img_load_pending.single_loop_load_count.borrow_mut() += 1;
+            } else if is_placeholder && !can_load_more {
+                // There are placeholders still in view, need to tell main loop to pass again.
+                *img_load_pending.needs_to_load.borrow_mut() = true;
+            }
+        } else if can_load_more {
+            let cached_img = self.get_home_tile_or_not_found(
+                display,
+                true_item_idx,
+                image_map,
+                &disp_ctrl_img_data.nf_id,
+            );
+
+            self.cached_img_id.push(cached_img);
             *img_load_pending.single_loop_load_count.borrow_mut() += 1;
-            img
         } else {
+            self.cached_img_id.push(CachedImgData::new(
+                disp_ctrl_img_data.placeholder_id,
+                PLACEHOLDER_AND_NOT_FOUND_SCALED_W,
+                PLACEHOLDER_AND_NOT_FOUND_SCALED_H,
+            ));
+
             *img_load_pending.needs_to_load.borrow_mut() = true;
-            Ok(None)
         }
     }
 
@@ -293,62 +350,12 @@ impl<'a> SetRow<'a> {
     ) -> Option<HighlightedItemData> {
         let true_item_idx = adjusted_item_idx + self.left_right_idx_adjustment;
 
-        let image_map = &mut disp_ctrl_img_data.image_map;
-        let ids = &disp_ctrl_img_data.ids;
+        self.populate_cache_if_needed(display, true_item_idx, disp_ctrl_img_data, img_load_pending);
 
-        let is_cached_but_is_placeholder = self.cached_img_id.get(true_item_idx).is_some()
-            && &self
-                .cached_img_id
-                .get(true_item_idx)
-                .as_ref()
-                .unwrap()
-                .img_id
-                == &disp_ctrl_img_data.placeholder_id;
-
-        if self.cached_img_id.get(true_item_idx).is_none() || is_cached_but_is_placeholder {
-            let img = self.get_item(
-                true_item_idx,
-                img_load_pending,
-                &disp_ctrl_img_data.placeholder_id,
-            );
-
-            match img {
-                Ok(Some(img)) => {
-                    let img = helpers::load_img(display, img);
-                    let (w, h) = (img.get_width(), img.get_height().unwrap());
-                    let img_id = image_map.insert(img);
-                    let w = (w as f64) * IMAGE_SCALE_DOWN_FACTOR;
-                    let h = (h as f64) * IMAGE_SCALE_DOWN_FACTOR;
-                    info!("put img {:?} ar {}", img_id, w / h);
-                    if is_cached_but_is_placeholder {
-                        self.cached_img_id[true_item_idx] = CachedImgData::new(img_id, w, h);
-                    } else {
-                        self.cached_img_id.push(CachedImgData::new(img_id, w, h));
-                    }
-                }
-                Ok(None) => {
-                    if !is_cached_but_is_placeholder {
-                        self.cached_img_id.push(CachedImgData::new(
-                            disp_ctrl_img_data.placeholder_id,
-                            500.0 * 0.75,
-                            220.0 * 0.75,
-                        ));
-                    }
-                }
-                Err(_) => {
-                    let img =
-                        CachedImgData::new(disp_ctrl_img_data.nf_id, 500.0 * 0.75, 220.0 * 0.75);
-                    if is_cached_but_is_placeholder {
-                        self.cached_img_id[true_item_idx] = img;
-                    } else {
-                        self.cached_img_id.push(img);
-                    }
-                }
-            }
-        }
-
-        // We know that from the previous if block there will be an item at true_item_idx now
+        // We know that from the previous call to populate_cache_if_needed there will be an item at true_item_idx now
         let data = self.cached_img_id.get(true_item_idx).unwrap();
+
+        let ids = &disp_ctrl_img_data.ids;
 
         let hd =
             if cursor.true_set_idx == self.true_set_idx && cursor.true_item_idx == true_item_idx {
@@ -715,7 +722,6 @@ struct HighlightedItemData {
     adjusted_item_idx: usize,
     adjusted_set_idx: usize,
 }
-
 
 /// Struct to communicate to the [`EventLoop`] that there is still data to be loaded.
 pub struct ImgLoadingNotifier {
