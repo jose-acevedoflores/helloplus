@@ -17,10 +17,8 @@
 //!    is always in view.
 //!
 //! ### Improvements
-//! - [`DisplayController::rows`] and [`DisplayController::image_map`] are currently "unbounded".
-//!   They are both technically bound by how many sets/items are fetched from the json data. Note
-//!   that the [`rows`](DisplayController::rows) has an accompanying [`fetch_row`](DisplayController::fetch_row)
-//!   function meant to be used as a way to dynamically load the rows and bound it like [Ids::imgs]
+//! - [`DisplayController image_map`](DisplayController::disp_ctrl_img_data) is currently "unbounded".
+//!   It is technically bound by how many sets/items are fetched from the json data.
 //! - [`SetRow::cached_img_id`] is also unbounded and could be set so that it follows the [Ids::imgs] pattern.
 //! - Currently, at start time, everything is loaded in one shot. It would be better to
 //!   break that out to work alongside the [`EventLoop`] to load rows dynamically to give the user some quick feedback.
@@ -161,7 +159,7 @@ impl EventLoop {
     }
 }
 
-/// Simple holder to keep track of the img_ids we've already placed in the [`image_map`](DisplayController::image_map)
+/// Simple holder to keep track of the img_ids we've already placed in the [`image_map`](DisplayController::disp_ctrl_img_data)
 struct CachedImgData {
     img_id: Id,
     w: f64,
@@ -187,7 +185,7 @@ struct SetRow<'a> {
     set_data: SetData<'a>,
     /// Unique id for this set of data.
     true_set_idx: usize,
-    /// Cached [`Id`] keys used to map the image data stored in the [`image_map`](DisplayController::image_map)
+    /// Cached [`Id`] keys used to map the image data stored in the [`image_map`](DisplayController::disp_ctrl_img_data)
     ///
     /// IMPROVEMENT: treat as a fixed sized array to only keep the items in view.
     cached_img_id: Vec<CachedImgData>,
