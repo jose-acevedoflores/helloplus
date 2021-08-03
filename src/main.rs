@@ -48,8 +48,15 @@ mod helpers;
 const DISPLAY_WIDTH: u32 = 1920;
 const DISPLAY_HEIGHT: u32 = 1080;
 
+/// Limit the time between fetches for the artwork.
+/// This helps give some times for input events to flow through even when we are still loading images.
+const ITEM_LOADING_LOOP_THRESHOLD: u128 = 190;
 /// Debounce value for handling the Left, Right, Up Down key strokes.
 const NAVIGATION_KEYS_DEBOUNCE_THRESHOLD: u128 = 180;
+/// We don't want to loop any faster than 60 FPS, so wait until it has been at least 16ms
+/// since the last yield.
+const MAIN_LOOP_TIME_FREQUENCY: u64 = 16;
+
 /// This field represents the number of visible rows given the [`ROW_HEIGHT`],the [`ROW_TOP_MARGIN`] and the [`DISPLAY_HEIGHT`]
 const NUM_ROWS: usize = 4;
 /// This field serves as the number of spaces reserved in the [Ids::imgs] field for a given row.
@@ -131,7 +138,7 @@ impl EventLoop {
         // We don't want to loop any faster than 60 FPS, so wait until it has been at least 16ms
         // since the last yield.
         let last_update = self.last_update;
-        let sixteen_ms = std::time::Duration::from_millis(16);
+        let sixteen_ms = std::time::Duration::from_millis(MAIN_LOOP_TIME_FREQUENCY);
         let duration_since_last_update = std::time::Instant::now().duration_since(last_update);
         if duration_since_last_update < sixteen_ms {
             std::thread::sleep(sixteen_ms - duration_since_last_update);
@@ -308,8 +315,9 @@ impl<'a> SetRow<'a> {
                     &disp_ctrl_img_data.nf_id,
                 );
 
+                // Replace the previously cached img.
                 self.cached_img_id[true_item_idx] = cached_img;
-                *img_load_pending.single_loop_load_count.borrow_mut() += 1;
+                img_load_pending.image_loaded();
             } else if is_placeholder && !can_load_more {
                 // There are placeholders still in view, need to tell main loop to pass again.
                 *img_load_pending.needs_to_load.borrow_mut() = true;
@@ -322,8 +330,9 @@ impl<'a> SetRow<'a> {
                 &disp_ctrl_img_data.nf_id,
             );
 
+            // Add new image.
             self.cached_img_id.push(cached_img);
-            *img_load_pending.single_loop_load_count.borrow_mut() += 1;
+            img_load_pending.image_loaded();
         } else {
             self.cached_img_id.push(CachedImgData::new(
                 disp_ctrl_img_data.placeholder_id,
@@ -761,12 +770,25 @@ struct HighlightedItemData {
 pub struct ImgLoadingNotifier {
     needs_to_load: RefCell<bool>,
     single_loop_load_count: RefCell<usize>,
+    last_download_time: RefCell<Option<Instant>>,
 }
 
 impl ImgLoadingNotifier {
     fn reset(&self) {
+        if let Some(last_update) = *self.last_download_time.borrow() {
+            let dur = std::time::Instant::now().duration_since(last_update);
+            if dur.as_millis() < ITEM_LOADING_LOOP_THRESHOLD {
+                return;
+            }
+        }
         *self.single_loop_load_count.borrow_mut() = 0;
         *self.needs_to_load.borrow_mut() = false;
+        *self.last_download_time.borrow_mut() = None;
+    }
+
+    fn image_loaded(&self) {
+        *self.single_loop_load_count.borrow_mut() += 1;
+        *self.last_download_time.borrow_mut() = Some(Instant::now());
     }
 }
 
@@ -782,6 +804,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let img_load_pending = Rc::new(ImgLoadingNotifier {
         needs_to_load: RefCell::new(true),
         single_loop_load_count: RefCell::new(0),
+        last_download_time: RefCell::new(None),
     });
 
     let mut renderer = conrod::backend::glium::Renderer::new(&display).unwrap();

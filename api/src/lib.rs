@@ -9,7 +9,6 @@
 use image::io::Reader as ImageReader;
 use image::{DynamicImage, ImageFormat};
 use log::info;
-use reqwest;
 use reqwest::StatusCode;
 use serde_json::Value;
 use std::io::Cursor;
@@ -109,6 +108,12 @@ impl<'a> SetData<'a> {
             let err_msg = format!("Did not find tile image for item num: '{}'", item_num);
             Err(err_msg.into())
         }
+    }
+}
+
+impl Default for Api {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
